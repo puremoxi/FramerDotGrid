@@ -1,4 +1,4 @@
-// Dot grid hero background with 3x3 cluster highlight on cursor hover, no wave/inertia effects
+// Dot grid hero background with NxN cluster highlight + optional trailing linger/fade
 import {
     useRef,
     useEffect,
@@ -20,6 +20,11 @@ interface DotGridHeroProps {
     hoverDotCount?: number
     smoothIntensity?: number
     style?: React.CSSProperties
+
+    // NEW: trailing controls
+    trailEnabled?: boolean
+    trailHoldMs?: number
+    trailFadeMs?: number
 }
 
 /**
@@ -36,11 +41,23 @@ export default function DotGridHero(props: DotGridHeroProps) {
         activeColor = "#FFFFFF",
         backgroundColor = "rgba(0, 0, 0, 0)",
         style,
+
+        // NEW
+        trailEnabled = false,
+        trailHoldMs = 180,
+        trailFadeMs = 520,
     } = props
+
     const containerRef = useRef<HTMLDivElement>(null)
     const [dimensions, setDimensions] = useState({ width: 0, height: 0 })
     const [hover, setHover] = useState<{ x: number; y: number } | null>(null)
     const isStatic = useIsStaticRenderer()
+
+    // NEW: per-dot "last activated" timestamps (ms since epoch)
+    const lastHitRef = useRef<Map<number, number>>(new Map())
+    // NEW: clock for trail animation (only ticks while needed)
+    const [now, setNow] = useState(0)
+    const rafRef = useRef<number | null>(null)
 
     // Responsive sizing
     useEffect(() => {
@@ -64,12 +81,14 @@ export default function DotGridHero(props: DotGridHeroProps) {
         const y = e.clientY - rect.top
         startTransition(() => setHover({ x, y }))
     }, [])
+
     const handleMouseLeave = useCallback(() => {
         startTransition(() => setHover(null))
+        // NOTE: do NOT clear lastHitRef here; trail should continue if enabled
     }, [])
 
     // Grid calculation
-    const { cols, rows, grid, cell } = useMemo(() => {
+    const { cols, rows, grid } = useMemo(() => {
         const cell = dotSize + gap
         const cols = Math.max(1, Math.floor((dimensions.width + gap) / cell))
         const rows = Math.max(1, Math.floor((dimensions.height + gap) / cell))
@@ -90,10 +109,10 @@ export default function DotGridHero(props: DotGridHeroProps) {
                 })
             }
         }
-        return { cols, rows, grid, cell }
+        return { cols, rows, grid }
     }, [dimensions, dotSize, gap])
 
-    // Find hovered dot index
+    // Find hovered dot
     const hoveredDot = useMemo(() => {
         if (!hover) return null
         let minDist = Infinity
@@ -109,11 +128,10 @@ export default function DotGridHero(props: DotGridHeroProps) {
         return grid[idx]
     }, [hover, grid])
 
-    // 3x3 cluster indices
+    // NxN cluster indices
     const activeSet = useMemo(() => {
-        if (!hoveredDot) return new Set()
+        if (!hoveredDot) return new Set<number>()
         const set = new Set<number>()
-        // Use hoverDotCount if provided, else fallback to hoverSquareRadius
         const count =
             typeof props.hoverDotCount === "number" ? props.hoverDotCount : 5
         const hoverRadius = Math.floor(count / 2)
@@ -159,6 +177,97 @@ export default function DotGridHero(props: DotGridHeroProps) {
         })
     }
 
+    // NEW: Update trail timestamps when hover cluster changes
+    useEffect(() => {
+        if (!trailEnabled) return
+        if (!hover) return
+        const t = performance.now()
+        activeSet.forEach((idx) => lastHitRef.current.set(idx, t))
+        // Ensure we have a clock tick at least once
+        setNow(t)
+    }, [trailEnabled, hover, activeSet])
+
+    // NEW: If trail is turned off, clear lingering state
+    useEffect(() => {
+        if (trailEnabled) return
+        lastHitRef.current.clear()
+        setNow(0)
+    }, [trailEnabled])
+
+    // NEW: RAF clock runs only while needed (hovering or lingering dots exist)
+    useEffect(() => {
+        if (isStatic) return
+
+        const shouldRun =
+            trailEnabled && (hover !== null || lastHitRef.current.size > 0)
+
+        if (!shouldRun) {
+            if (rafRef.current) cancelAnimationFrame(rafRef.current)
+            rafRef.current = null
+            return
+        }
+
+        let mounted = true
+        const tick = () => {
+            if (!mounted) return
+            const t = performance.now()
+            setNow(t)
+
+            // Cleanup expired dots to stop RAF naturally
+            const hold = Math.max(0, trailHoldMs)
+            const fade = Math.max(0, trailFadeMs)
+            const expire = hold + fade
+
+            if (expire <= 0) {
+                lastHitRef.current.clear()
+            } else {
+                for (const [idx, hit] of lastHitRef.current.entries()) {
+                    if (t - hit > expire) lastHitRef.current.delete(idx)
+                }
+            }
+
+            const stillNeeded =
+                trailEnabled &&
+                (hover !== null || lastHitRef.current.size > 0)
+
+            if (stillNeeded) {
+                rafRef.current = requestAnimationFrame(tick)
+            } else {
+                rafRef.current = null
+            }
+        }
+
+        rafRef.current = requestAnimationFrame(tick)
+
+        return () => {
+            mounted = false
+            if (rafRef.current) cancelAnimationFrame(rafRef.current)
+            rafRef.current = null
+        }
+    }, [isStatic, trailEnabled, trailHoldMs, trailFadeMs, hover])
+
+    // NEW: activation level per dot (0..1) combining hover + trail
+    const getTrailLevel = useCallback(
+        (i: number) => {
+            if (!trailEnabled) return 0
+            const hit = lastHitRef.current.get(i)
+            if (hit == null) return 0
+
+            const hold = Math.max(0, trailHoldMs)
+            const fade = Math.max(0, trailFadeMs)
+            const elapsed = now - hit
+
+            // Fully on during hold
+            if (elapsed <= hold) return 1
+
+            // Fade down after hold
+            if (fade <= 0) return 0
+            const t = (elapsed - hold) / fade
+            return Math.max(0, Math.min(1, 1 - t))
+        },
+        [trailEnabled, trailHoldMs, trailFadeMs, now]
+    )
+
     // Render
     return (
         <section
@@ -185,48 +294,74 @@ export default function DotGridHero(props: DotGridHeroProps) {
                 aria-hidden="true"
             >
                 {grid.map((dot, i) => {
-                    let scale = 1
-                    let color = baseColor
-                    let isActive = false
-                    if (hover && activeSet.has(i) && hoveredDot) {
-                        isActive = true
-                        // Calculate distance from hovered dot in grid coordinates
+                    const baseRadius =
+                        typeof props.circleRadius === "number"
+                            ? props.circleRadius
+                            : dotSize / 2
+
+                    // Base state
+                    let level = 0 // 0..1
+                    let scaleTarget = 1
+
+                    // If currently hovered, hard-override to level 1
+                    const isHoverActive = !!(hover && activeSet.has(i) && hoveredDot)
+
+                    if (isHoverActive && hoveredDot) {
+                        level = 1
+
+                        // Distance-based scale falloff
                         const dRow = Math.abs(dot.row - hoveredDot.row)
                         const dCol = Math.abs(dot.col - hoveredDot.col)
                         const dist = Math.max(dRow, dCol)
-                        // All dots in hover square get activeColor, no blending
-                        color = activeColor
-                        // Gradually decrease scale as distance increases
-                        // SMOOTHER: use exponential falloff for scale
+
                         const maxDist = Math.floor(
                             (typeof props.hoverDotCount === "number"
                                 ? props.hoverDotCount
                                 : 5) / 2
                         )
                         const t = 1 - dist / (maxDist === 0 ? 1 : maxDist)
-                        // Intensity control for smoothness
                         const intensity =
                             typeof props.smoothIntensity === "number"
                                 ? props.smoothIntensity
                                 : 0.95
-                        scale = 1 + intensity * Math.max(0, t)
+
+                        scaleTarget = 1 + intensity * Math.max(0, t)
+                    } else {
+                        // Not currently hovered; optionally trail
+                        level = getTrailLevel(i)
+                        // When trailing, keep the "peak" scaleTarget at the max hover scale
+                        // (simple + punchy; if you want it to preserve per-dot dist scale, we can store dist too)
+                        if (level > 0) {
+                            const intensity =
+                                typeof props.smoothIntensity === "number"
+                                    ? props.smoothIntensity
+                                    : 0.95
+                            scaleTarget = 1 + intensity
+                        }
                     }
-                    const baseRadius =
-                        typeof props.circleRadius === "number"
-                            ? props.circleRadius
-                            : dotSize / 2
+
+                    // Blend back to base using level
+                    const color = level > 0 ? blend(baseColor, activeColor, level) : baseColor
+
+                    // Ease radius back to base with level
+                    const scale = 1 + (scaleTarget - 1) * level
+                    const r = baseRadius * scale
+
+                    // Keep transitions for "pop", but trail is driven by RAF updates
+                    const useTransition = hover !== null || (trailEnabled && lastHitRef.current.size > 0)
+
                     return (
                         <circle
                             key={i}
                             cx={dot.x}
                             cy={dot.y}
-                            r={baseRadius * scale}
+                            r={r}
                             fill={color}
                             style={{
-                                transition: hover
-                                    ? "r 0.22s cubic-bezier(.4,1.2,.4,1), fill 0.18s cubic-bezier(.4,1.2,.4,1)"
+                                transition: useTransition
+                                    ? "r 0.18s cubic-bezier(.4,1.2,.4,1), fill 0.14s cubic-bezier(.4,1.2,.4,1)"
                                     : "none",
-                                willChange: hover ? "r, fill" : undefined,
+                                willChange: useTransition ? "r, fill" : undefined,
                             }}
                         />
                     )
@@ -303,5 +438,34 @@ addPropertyControls(DotGridHero, {
         unit: "x",
         description:
             "Controls the zoom intensity of the hover animation (higher = more zoom)",
+    },
+
+    // NEW: Trailing controls
+    trailEnabled: {
+        type: ControlType.Boolean,
+        title: "Trail Enabled",
+        defaultValue: false,
+    },
+    trailHoldMs: {
+        type: ControlType.Number,
+        title: "Trail Hold",
+        defaultValue: 180,
+        min: 0,
+        max: 2000,
+        step: 10,
+        unit: "ms",
+        description: "How long dots stay fully active after leaving the cursor",
+        hidden: (p) => !p.trailEnabled,
+    },
+    trailFadeMs: {
+        type: ControlType.Number,
+        title: "Trail Fade",
+        defaultValue: 520,
+        min: 0,
+        max: 4000,
+        step: 10,
+        unit: "ms",
+        description: "How long dots take to fade back to base",
+        hidden: (p) => !p.trailEnabled,
     },
 })
